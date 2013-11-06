@@ -14,7 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import os
 import pprint
+import re
 import socket
 import string
 import sys
@@ -60,6 +62,10 @@ zmq_opts = [
 
     cfg.IntOpt('rpc_zmq_contexts', default=1,
                help='Number of ZeroMQ contexts, defaults to 1'),
+
+    cfg.IntOpt('rpc_zmq_topic_backlog', default=None,
+               help='Maximum number of ingress messages to locally buffer '
+                    'per topic. Default is unlimited.'),
 
     cfg.StrOpt('rpc_zmq_ipc_dir', default='/var/run/openstack',
                help='Directory for holding IPC sockets'),
@@ -137,6 +143,16 @@ class ZmqSocket(object):
         try:
             if bind:
                 self.sock.bind(addr)
+                try:
+                    import re
+                    if re.match('^ipc', addr):
+                        ipcpath = re.sub("ipc://", "", addr)
+                        import os
+                        if os.path.exists(ipcpath):
+                            os.chmod(ipcpath, 0770)
+                except Exception:
+                    raise RPCException(_(
+                        "Could not change permissions on handle."))
             else:
                 self.sock.connect(addr)
         except Exception:
@@ -168,7 +184,7 @@ class ZmqSocket(object):
         self.sock.setsockopt(zmq.UNSUBSCRIBE, msg_filter)
         self.subscriptions.remove(msg_filter)
 
-    def close(self):
+    def close(self, linger=-1):
         if self.sock is None or self.sock.closed:
             return
 
@@ -183,9 +199,13 @@ class ZmqSocket(object):
 
         # Linger -1 prevents lost/dropped messages
         try:
-            self.sock.close(linger=-1)
+            self.sock.close(linger)
         except Exception:
-            pass
+            # While this is a bad thing to happen,
+            # it would be much worse if some of the code calling this
+            # were to fail. For now, lets log, and later evaluate
+            # if we can safely raise here.
+            LOG.error("ZeroMQ socket could not be closed.")
         self.sock = None
 
     def recv(self):
@@ -209,8 +229,8 @@ class ZmqClient(object):
         self.outq.send([str(msg_id), str(topic), str('cast'),
                         _serialize(data)])
 
-    def close(self):
-        self.outq.close()
+    def close(self, linger):
+        self.outq.close(linger)
 
 
 class RpcContext(rpc_common.CommonRpcContext):
@@ -402,14 +422,11 @@ class ZmqProxy(ZmqBaseReactor):
 
     def __init__(self, conf):
         super(ZmqProxy, self).__init__(conf)
+        pathsep = set((os.path.sep or '', os.path.altsep or '', '/', '\\'))
+        self.badchars = re.compile(r'[%s]' % re.escape(''.join(pathsep)))
 
         self.topic_proxy = {}
         ipc_dir = CONF.rpc_zmq_ipc_dir
-
-        self.topic_proxy['zmq_replies'] = \
-            ZmqSocket("ipc://%s/zmq_topic_zmq_replies" % (ipc_dir, ),
-                      zmq.PUB, bind=True)
-        self.sockets.append(self.topic_proxy['zmq_replies'])
 
     def consume(self, sock):
         ipc_dir = CONF.rpc_zmq_ipc_dir
@@ -434,21 +451,57 @@ class ZmqProxy(ZmqBaseReactor):
         else:
             sock_type = zmq.PUSH
 
-        if not topic in self.topic_proxy:
-            outq = ZmqSocket("ipc://%s/zmq_topic_%s" % (ipc_dir, topic),
-                             sock_type, bind=True)
-            self.topic_proxy[topic] = outq
-            self.sockets.append(outq)
-            LOG.info(_("Created topic proxy: %s"), topic)
+        if topic not in self.topic_proxy:
+            def publisher(waiter):
+                LOG.info(_("Creating proxy for topic: %s"), topic)
 
-            # It takes some time for a pub socket to open,
-            # before we can have any faith in doing a send() to it.
-            if sock_type == zmq.PUB:
-                eventlet.sleep(.5)
+                try:
+                    # The topic is received over the network,
+                    # don't trust this input.
+                    if self.badchars.search(topic) is not None:
+                        emsg = _("Topic contained dangerous characters.")
+                        LOG.warn(emsg)
+                        raise RPCException(emsg)
 
-        LOG.debug(_("ROUTER RELAY-OUT START %(data)s") % {'data': data})
-        self.topic_proxy[topic].send(data)
-        LOG.debug(_("ROUTER RELAY-OUT SUCCEEDED %(data)s") % {'data': data})
+                    out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
+                                         (ipc_dir, topic),
+                                         sock_type, bind=True)
+                except RPCException:
+                    waiter.send_exception(*sys.exc_info())
+                    return
+
+                self.topic_proxy[topic] = eventlet.queue.LightQueue(
+                    CONF.rpc_zmq_topic_backlog)
+                self.sockets.append(out_sock)
+
+                # It takes some time for a pub socket to open,
+                # before we can have any faith in doing a send() to it.
+                if sock_type == zmq.PUB:
+                    eventlet.sleep(.5)
+
+                waiter.send(True)
+
+                while(True):
+                    data = self.topic_proxy[topic].get()
+                    out_sock.send(data)
+                    LOG.debug(_("ROUTER RELAY-OUT SUCCEEDED %(data)s") %
+                              {'data': data})
+
+            wait_sock_creation = eventlet.event.Event()
+            eventlet.spawn(publisher, wait_sock_creation)
+            try:
+                wait_sock_creation.wait()
+            except RPCException:
+                LOG.error(_("Topic socket file creation failed."))
+                return
+
+        try:
+            self.topic_proxy[topic].put_nowait(data)
+            LOG.debug(_("ROUTER RELAY-OUT QUEUED %(data)s") %
+                      {'data': data})
+        except eventlet.queue.Full:
+            LOG.error(_("Local per-topic backlog buffer full for topic "
+                        "%(topic)s. Dropping message.") % {'topic': topic})
 
 
 class ZmqReactor(ZmqBaseReactor):
@@ -524,24 +577,36 @@ class Connection(rpc_common.Connection):
         self.reactor.consume_in_thread()
 
 
-def _cast(addr, context, msg_id, topic, msg, timeout=None):
+class ConnectError(Exception):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return repr(self.value)
+
+
+def _cast(addr, context, msg_id, topic, msg, zmq_receiver_listening,
+          timeout=None):
+    if zmq_receiver_listening is False:
+        return zmq_receiver_listening
     timeout_cast = timeout or CONF.rpc_cast_timeout
     payload = [RpcContext.marshal(context), msg]
 
-    with Timeout(timeout_cast, exception=rpc_common.Timeout):
-        try:
-            conn = ZmqClient(addr)
+    try:
+        conn = ZmqClient(addr)
 
-            # assumes cast can't return an exception
-            conn.cast(msg_id, topic, payload)
-        except zmq.ZMQError:
-            raise RPCException("Cast failed. ZMQ Socket Exception")
-        finally:
-            if 'conn' in vars():
-                conn.close()
+        # assumes cast can't return an exception
+        conn.cast(msg_id, topic, payload)
+        conn.close(timeout_cast)
+    except zmq.ZMQError:
+        raise RPCException("Cast failed. ZMQ Socket Exception")
+    return zmq_receiver_listening
 
 
-def _call(addr, context, msg_id, topic, msg, timeout=None):
+def _call(addr, context, msg_id, topic, msg, zmq_receiver_listening,
+          timeout=None):
+    if zmq_receiver_listening is False:
+        return ('', zmq_receiver_listening)
     # timeout_response is how long we wait for a response
     timeout = timeout or CONF.rpc_response_timeout
 
@@ -576,7 +641,8 @@ def _call(addr, context, msg_id, topic, msg, timeout=None):
             )
 
             LOG.debug(_("Sending cast"))
-            _cast(addr, context, msg_id, topic, payload)
+            _cast(addr, context, msg_id, topic, payload,
+                  zmq_receiver_listening)
 
             LOG.debug(_("Cast sent; Waiting reply"))
             # Blocks until receives reply
@@ -599,8 +665,19 @@ def _call(addr, context, msg_id, topic, msg, timeout=None):
         if isinstance(resp, types.DictType) and 'exc' in resp:
             raise rpc_common.deserialize_remote_exception(CONF, resp['exc'])
 
-    return responses[-1]
+    return (responses[-1], zmq_receiver_listening)
 
+import socket
+
+def _does_service_exist(host, port):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((host, port))
+        s.close()
+    except:
+        return False
+    return True
 
 def _multi_send(method, context, topic, msg, timeout=None):
     """
@@ -626,11 +703,27 @@ def _multi_send(method, context, topic, msg, timeout=None):
         (_topic, ip_addr) = queue
         _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
 
-        if method.__name__ == '_cast':
-            eventlet.spawn_n(method, _addr, context,
-                             _topic, _topic, msg, timeout)
-            return
-        return method(_addr, context, _topic, _topic, msg, timeout)
+        # Bluehost multi-backend code
+        # Prior to spawning a zmq thread to deliver the message, we check to
+        # see if there is a receiver listening; if there is not, skip spawning
+        # the thread, and set zmq_receiver_listening to false
+        try:
+            out = _does_service_exist(ip_addr, conf.rpc_zmq_port)
+            if not out:
+                raise ConnectError('Unable to connect to zmq on remote host')
+        except ConnectError:
+            hostaddr = "%s:%s" % (ip_addr, conf.rpc_zmq_port)
+            LOG.warn(_("zmq error: zmq connection to %s refused") % hostaddr)
+            zmq_receiver_listening = False
+        else:
+            zmq_receiver_listening = True
+            if method.__name__ == '_cast':
+                eventlet.spawn_n(method, _addr, context,
+                                 _topic, _topic, msg,
+                                 zmq_receiver_listening, timeout)
+                return zmq_receiver_listening
+        return method(_addr, context, _topic, _topic, msg,
+                      zmq_receiver_listening, timeout)
 
 
 def create_connection(conf, new=True):
@@ -639,25 +732,36 @@ def create_connection(conf, new=True):
 
 def multicall(conf, *args, **kwargs):
     """Multiple calls."""
-    return _multi_send(_call, *args, **kwargs)
+    retval = _multi_send(_call, *args, **kwargs)
+    data = retval[0]
+    zmq_receiver_listening = retval[1]
+    return (data, zmq_receiver_listening)
 
 
 def call(conf, *args, **kwargs):
     """Send a message, expect a response."""
-    data = _multi_send(_call, *args, **kwargs)
-    return data[-1]
+    retval = _multi_send(_call, *args, **kwargs)
+    zmq_receiver_listening = retval[1]
+    if zmq_receiver_listening is False:
+        data = ['', '']
+    else:
+        data = retval[0]
+    return (data[-1], zmq_receiver_listening)
 
 
 def cast(conf, *args, **kwargs):
     """Send a message expecting no reply."""
-    _multi_send(_cast, *args, **kwargs)
+    zmq_receiver_listening = _multi_send(_cast, *args, **kwargs)
+    return zmq_receiver_listening
 
 
 def fanout_cast(conf, context, topic, msg, **kwargs):
     """Send a message to all listening and expect no reply."""
     # NOTE(ewindisch): fanout~ is used because it avoid splitting on .
     # and acts as a non-subtle hint to the matchmaker and ZmqProxy.
-    _multi_send(_cast, context, 'fanout~' + str(topic), msg, **kwargs)
+    retval = _multi_send(_cast, context, 'fanout~' + str(topic), msg, **kwargs)
+    zmq_receiver_listening = retval
+    return zmq_receiver_listening
 
 
 def notify(conf, context, topic, msg, **kwargs):
@@ -669,7 +773,8 @@ def notify(conf, context, topic, msg, **kwargs):
     # NOTE(ewindisch): dot-priority in rpc notifier does not
     # work with our assumptions.
     topic.replace('.', '-')
-    cast(conf, context, topic, msg, **kwargs)
+    zmq_receiver_listening = cast(conf, context, topic, msg, **kwargs)
+    return zmq_receiver_listening
 
 
 def cleanup():

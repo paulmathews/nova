@@ -27,7 +27,9 @@ For some wrappers that add message versioning to rpc, see:
 
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
+from nova.openstack.common import log as logging
 
+LOG = logging.getLogger(__name__)
 
 rpc_opts = [
     cfg.StrOpt('rpc_backend',
@@ -82,7 +84,14 @@ def create_connection(new=True):
 
     :returns: An instance of openstack.common.rpc.common.Connection
     """
-    return _get_impl().create_connection(cfg.CONF, new=new)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        qpidobj = importutils.import_module(
+            "nova.openstack.common.rpc.impl_qpid")
+        return (_get_impl().create_connection(cfg.CONF, new=new),
+                qpidobj.create_connection(cfg.CONF, new=new))
+    else:
+        # retun the single object as a tuple, as we iterate over it
+        return (_get_impl().create_connection(cfg.CONF, new=new),)
 
 
 def call(context, topic, msg, timeout=None):
@@ -105,7 +114,19 @@ def call(context, topic, msg, timeout=None):
     :raises: openstack.common.rpc.common.Timeout if a complete response
              is not received before the timeout is reached.
     """
-    return _get_impl().call(cfg.CONF, context, topic, msg, timeout)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        (retval, zmq_receiver_listening) = _get_impl().call(
+            cfg.CONF, context, topic, msg, timeout)
+        if zmq_receiver_listening is True:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast successful"))
+            return retval
+        else:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast failed, casting to qpid"))
+            qpidobj = importutils.import_module(
+                "nova.openstack.common.rpc.impl_qpid")
+            return qpidobj.call(cfg.CONF, context, topic, msg, timeout)
+    else:
+        return _get_impl().call(cfg.CONF, context, topic, msg, timeout)
 
 
 def cast(context, topic, msg):
@@ -123,7 +144,18 @@ def cast(context, topic, msg):
 
     :returns: None
     """
-    return _get_impl().cast(cfg.CONF, context, topic, msg)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        zmq_receiver_listening = _get_impl().cast(
+            cfg.CONF, context, topic, msg)
+        if zmq_receiver_listening is True:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast successful"))
+        else:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast failed, casting to qpid"))
+            qpidobj = importutils.import_module(
+                "nova.openstack.common.rpc.impl_qpid")
+            return qpidobj.cast(cfg.CONF, context, topic, msg)
+    else:
+        return _get_impl().cast(cfg.CONF, context, topic, msg)
 
 
 def fanout_cast(context, topic, msg):
@@ -144,7 +176,18 @@ def fanout_cast(context, topic, msg):
 
     :returns: None
     """
-    return _get_impl().fanout_cast(cfg.CONF, context, topic, msg)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        zmq_receiver_listening = _get_impl().fanout_cast(
+            cfg.CONF, context, topic, msg)
+        if zmq_receiver_listening is True:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast successful"))
+        else:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast failed, casting to qpid"))
+            qpidobj = importutils.import_module(
+                "nova.openstack.common.rpc.impl_qpid")
+            return qpidobj.fanout_cast(cfg.CONF, context, topic, msg)
+    else:
+        return _get_impl().fanout_cast(cfg.CONF, context, topic, msg)
 
 
 def multicall(context, topic, msg, timeout=None):
@@ -174,7 +217,19 @@ def multicall(context, topic, msg, timeout=None):
     :raises: openstack.common.rpc.common.Timeout if a complete response
              is not received before the timeout is reached.
     """
-    return _get_impl().multicall(cfg.CONF, context, topic, msg, timeout)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        (retval, zmq_receiver_listening) = _get_impl().multicall(
+            cfg.CONF, context, topic, msg, timeout)
+        if zmq_receiver_listening is True:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast successful"))
+            return retval
+        else:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast failed, casting to qpid"))
+            qpidobj = importutils.import_module(
+                "nova.openstack.common.rpc.impl_qpid")
+            return qpidobj.multicall(cfg.CONF, context, topic, msg, timeout)
+    else:
+        return _get_impl().multicall(cfg.CONF, context, topic, msg, timeout)
 
 
 def notify(context, topic, msg):
@@ -187,7 +242,18 @@ def notify(context, topic, msg):
 
     :returns: None
     """
-    return _get_impl().notify(cfg.CONF, context, topic, msg)
+    if cfg.CONF.rpc_backend == "nova.rpc.impl_zmq":
+        zmq_receiver_listening = _get_impl().notify(
+            cfg.CONF, context, topic, msg)
+        if zmq_receiver_listening is True:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast successful"))
+        else:
+            LOG.warn(_("DUPLICATE_RPC_CALL: zmq cast failed, casting to qpid"))
+            qpidobj = importutils.import_module(
+                "nova.openstack.common.rpc.impl_qpid")
+            return qpidobj.notify(cfg.CONF, context, topic, msg)
+    else:
+        return _get_impl().notify(cfg.CONF, context, topic, msg)
 
 
 def cleanup():
